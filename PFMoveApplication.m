@@ -56,9 +56,12 @@ static BOOL IsInDownloadsFolder(NSString *path);
 static BOOL Trash(NSString *path);
 static BOOL AuthorizedInstall(NSString *srcPath, NSString *dstPath, BOOL *canceled);
 static BOOL CopyBundle(NSString *srcPath, NSString *dstPath);
+static BOOL TerminateLaunchedApplication(NSDictionary * app);
+static BOOL TerminateRunningApplication(NSRunningApplication * app);
 
 
 // Main worker function
+
 void PFMoveToApplicationsFolderIfNecessary() {
 	// Skip if user suppressed the alert before
 	if ([[NSUserDefaults standardUserDefaults] boolForKey:AlertSuppressKey]) return;
@@ -160,27 +163,40 @@ void PFMoveToApplicationsFolderIfNecessary() {
 			if ([fm fileExistsAtPath:destinationPath]) {
 				// But first, make sure that it's not running
 				BOOL destinationIsRunning = NO;
+                NSWorkspace * workspace = [NSWorkspace sharedWorkspace];
 
 				// Use the shell to determine if the app is already running on systems 10.5 or lower
-				if (floor(NSAppKitVersionNumber) <= NSAppKitVersionNumber10_5) {
-					NSString *script = [NSString stringWithFormat:@"ps ax -o comm | grep '%@/' | grep -v grep >/dev/null", destinationPath];
-					NSTask *task = [NSTask launchedTaskWithLaunchPath:@"/bin/sh" arguments:[NSArray arrayWithObjects:@"-c", script, nil]];
-					[task waitUntilExit];
-
-					// If the task terminated with status 0, it means that the final grep produced 1 or more lines of output.
-					// Which means that the app is already running
-					destinationIsRunning = ([task terminationStatus] == 0);
-				}
-				// Use the new API on 10.6 or higher
-				else {
-					for (NSRunningApplication *runningApplication in [[NSWorkspace sharedWorkspace] runningApplications]) {
+                if ([workspace respondsToSelector: @selector(runningApplications)]) {
+                    for (NSRunningApplication *runningApplication in [workspace runningApplications]) {
 						NSString *executablePath = [[runningApplication executableURL] path];
-						if ([[executablePath substringToIndex:[destinationPath length]] isEqualToString:destinationPath]) {
-							destinationIsRunning = YES;
-							break;
-						}
-					}
-				}
+                        @try {
+                            if ([[executablePath substringToIndex:[destinationPath length]] isEqualToString:destinationPath]) {
+                                if (! TerminateRunningApplication(runningApplication)) {
+                                    destinationIsRunning = YES;
+                                    break;
+                                }
+                            }
+                        }
+                        @catch (NSException *exception) {
+                        }
+					}                
+                }
+                else {
+                    // Fallback code for 10.5 and earlier
+                    for (NSDictionary * app in [workspace launchedApplications]) {
+                        NSString * appPath = [app objectForKey: @"NSApplicationPath"];
+                        @try {
+                            if ([[appPath substringToIndex:[destinationPath length]] isEqualToString:destinationPath]) {
+                                if (! TerminateLaunchedApplication(app)) {
+                                    destinationIsRunning = YES;
+                                    break;
+                                }
+                            }
+                        }
+                        @catch (NSException * exception) {
+                        }
+                    }
+                }
 
 				if (destinationIsRunning) {
 					// Give the running app focus and terminate myself
@@ -427,4 +443,118 @@ static BOOL CopyBundle(NSString *srcPath, NSString *dstPath) {
 	}
 #endif
 	return NO;
+}
+
+@interface RunningAppObserver : NSObject {    
+}
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context;
+@end
+
+@implementation RunningAppObserver
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    NSLog(@"app.terminated has changed");
+    NSRunningApplication * app = object;
+    if (app.terminated) {
+        NSLog(@"Stopping run loop");
+        CFRunLoopStop(CFRunLoopGetMain());
+    }
+}
+
+@end
+
+static BOOL TerminateRunningApplication(NSRunningApplication * app) {
+    if (! app.terminated) {
+        [app activateWithOptions: 0];
+        NSLog(@"Terminating app %@", [[app executableURL] path]);
+        if ([app terminate]) {
+            if (! app.terminated) {
+                NSLog(@"Waiting for %@ to terminate", [[app executableURL] path]);
+                RunningAppObserver * observer = [[RunningAppObserver alloc] init];
+                [app addObserver: observer forKeyPath: @"terminated" options: NSKeyValueObservingOptionNew context: nil];
+#if 0
+                [[NSRunLoop mainRunLoop] runUntilDate: [NSDate dateWithTimeIntervalSinceNow: 30.0]];
+#else
+                NSDate * limit = [[NSDate dateWithTimeIntervalSinceNow: 30.0] retain];
+                while ((! app.terminated) && [[NSDate dateWithTimeIntervalSinceNow: 0] isLessThan: limit]) {
+                    NSLog(@"bip");
+                    [[NSRunLoop mainRunLoop] runMode: NSDefaultRunLoopMode beforeDate: limit];
+                }
+#endif
+                NSLog(@"Run loop has returned");
+                [observer release];
+            }
+        }
+    }
+    NSLog(@"App has%@ terminated", app.terminated ? @"" : @" not");
+    return app.terminated;
+}
+
+@interface LaunchedAppObserver: NSObject {
+@private
+    pid_t  targetProcessID;
+    BOOL   terminated;
+}
+- (id) initWithProcessID: (pid_t)processID;
+- (void) applicationTerminated: (NSNotification *)notification;
+- (BOOL) terminated;
+@end
+
+@implementation LaunchedAppObserver
+
+- (id) initWithProcessID: (pid_t)processID {
+    if ((self = [super init])) {
+        targetProcessID = processID;
+        terminated = NO;
+    }
+    return self;
+}
+
+- (void) applicationTerminated: (NSNotification *)notification {
+    NSNumber * processIDObj = [[notification userInfo] objectForKey: @"NSApplicationProcessIdentifier"];
+    pid_t pid = [processIDObj intValue];
+    if (pid == targetProcessID) {
+        terminated = YES;
+    }
+}
+
+- (BOOL) terminated {
+    return terminated;
+}
+
+@end
+
+
+static BOOL TerminateLaunchedApplication(NSDictionary * app) {
+    
+    NSNumber * processIDObj = [app objectForKey: @"NSApplicationProcessIdentifier"];
+    pid_t processID = [processIDObj intValue];
+    LaunchedAppObserver * observer = [[LaunchedAppObserver alloc] initWithProcessID: processID];
+    NSWorkspace * workspace = [NSWorkspace sharedWorkspace];
+    [[workspace notificationCenter] addObserver: observer selector: @selector(applicationTerminated:) name: NSWorkspaceDidTerminateApplicationNotification object: workspace];
+    
+    OSStatus err;
+    AppleEvent event, reply;
+    
+    err = AEBuildAppleEvent(kCoreEventClass, kAEQuitApplication,
+                            typeKernelProcessID, 
+                            &processID, sizeof(processID),
+                            kAutoGenerateReturnID, kAnyTransactionID,
+                            &event, NULL, "");
+    
+    if (err == noErr) {
+        err = AESendMessage(&event, &reply, kAENoReply, kAEDefaultTimeout);
+        (void)AEDisposeDesc(&event);
+    }
+    
+    // Wait up to 30 seconds for the process to terminate
+    NSDate * limit = [[NSDate dateWithTimeIntervalSinceNow: 30.0] retain];
+    while ((! [observer terminated]) && [[NSDate dateWithTimeIntervalSinceNow: 0] isLessThan: limit]) {
+        NSLog(@"bip");
+        [[NSRunLoop mainRunLoop] runMode: NSDefaultRunLoopMode beforeDate: limit];
+    }
+
+    
+    [observer autorelease];
+    return [observer terminated];
 }
